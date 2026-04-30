@@ -119,7 +119,7 @@ impl Downstream {
             outbound_rx,
             inbound_tx,
             connection_token.clone(),
-            fallback_coordinator.clone(),
+            Some(fallback_coordinator.clone()),
         );
 
         let downstream_channel = DownstreamChannel {

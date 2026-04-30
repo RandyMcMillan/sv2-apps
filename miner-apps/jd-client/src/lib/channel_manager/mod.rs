@@ -443,6 +443,7 @@ impl ChannelManager {
         let this = Arc::new(self);
 
         // Wait for initial template and prevhash before accepting connections
+        let fallback_token = fallback_coordinator.token();
         loop {
             let has_required_data = this.channel_manager_data.super_safe_lock(|data| {
                 data.last_future_template.is_some() && data.last_new_prev_hash.is_some()
@@ -459,6 +460,10 @@ impl ChannelManager {
                     info!("Channel Manager: received shutdown while waiting for templates");
                     return Ok(());
                 }
+                _ = fallback_token.cancelled() => {
+                    info!("Channel Manager: received fallback while waiting for templates");
+                    return Ok(());
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }
@@ -473,7 +478,6 @@ impl ChannelManager {
         // Register the listener task in fallback coordination, so fallback waits
         // for this accept loop to stop before attempting to re-bind the same port.
         let fallback_handler = fallback_coordinator.register();
-        let fallback_token = fallback_coordinator.token();
         task_manager.spawn(async move {
             loop {
                 select! {
@@ -635,7 +639,9 @@ impl ChannelManager {
                     res = &mut vardiff_future => {
                         info!("Vardiff loop completed with: {res:?}");
                     }
-                    res = cm_jds.handle_jds_message() => {
+                    res = cm_jds.handle_jds_message(),
+                        if !cm.channel_manager_channel.jd_receiver.is_closed() =>
+                    {
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling JDS message");
                             if handle_error(&status_sender, e).await {
@@ -643,7 +649,9 @@ impl ChannelManager {
                             }
                         }
                     }
-                    res = cm_pool.handle_pool_message_frame() => {
+                    res = cm_pool.handle_pool_message_frame(),
+                        if !cm.channel_manager_channel.upstream_receiver.is_closed() =>
+                    {
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling Pool message");
                             if handle_error(&status_sender, e).await {

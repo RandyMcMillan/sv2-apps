@@ -79,9 +79,13 @@ impl JobDeclaratorClient {
         let miner_coinbase_outputs = vec![self.config.get_txout()];
         let mut encoded_outputs = vec![];
 
-        miner_coinbase_outputs
-            .consensus_encode(&mut encoded_outputs)
-            .expect("Invalid coinbase output in config");
+        if let Err(e) = miner_coinbase_outputs.consensus_encode(&mut encoded_outputs) {
+            error!(error = ?e, "Invalid coinbase output in config");
+            self.cancellation_token.cancel();
+            self.shutdown_notify.notify_waiters();
+            self.is_alive.store(false, Ordering::Relaxed);
+            return;
+        }
 
         let mut fallback_coordinator = FallbackCoordinator::new();
         let task_manager = Arc::new(TaskManager::new());
@@ -104,7 +108,7 @@ impl JobDeclaratorClient {
 
         debug!("Channels initialized.");
 
-        let mut channel_manager = ChannelManager::new(
+        let mut channel_manager = match ChannelManager::new(
             self.config.clone(),
             channel_manager_to_upstream_sender.clone(),
             upstream_to_channel_manager_receiver.clone(),
@@ -118,7 +122,16 @@ impl JobDeclaratorClient {
             self.config.required_extensions().to_vec(),
         )
         .await
-        .unwrap();
+        {
+            Ok(channel_manager) => channel_manager,
+            Err(e) => {
+                error!(error = ?e, "Failed to initialize channel manager");
+                self.cancellation_token.cancel();
+                self.shutdown_notify.notify_waiters();
+                self.is_alive.store(false, Ordering::Relaxed);
+                return;
+            }
+        };
 
         // Start monitoring server if configured
         #[cfg(feature = "monitoring")]
@@ -128,65 +141,81 @@ impl JobDeclaratorClient {
                 monitoring_addr
             );
 
-            let monitoring_server = stratum_apps::monitoring::MonitoringServer::new(
+            let monitoring_server = match stratum_apps::monitoring::MonitoringServer::new(
                 monitoring_addr,
                 Some(Arc::new(channel_manager.clone())), // SV2 channels opened with servers
                 Some(Arc::new(channel_manager.clone())), // SV2 channels opened with clients
                 std::time::Duration::from_secs(
                     self.config.monitoring_cache_refresh_secs().unwrap_or(15),
                 ),
-            )
-            .expect("Failed to initialize monitoring server");
-
-            // Create shutdown signal using cancellation token
-            let cancellation_token_clone = self.cancellation_token.clone();
-            let fallback_coordinator_token = fallback_coordinator.token();
-            let shutdown_signal = async move {
-                tokio::select! {
-                    _ = cancellation_token_clone.cancelled() => {
-                        info!("Monitoring server: received shutdown signal.");
-                    }
-                    _ = fallback_coordinator_token.cancelled() => {
-                        info!("Monitoring server: fallback triggered.");
-                    }
+            ) {
+                Ok(monitoring_server) => Some(monitoring_server),
+                Err(e) => {
+                    error!(error = ?e, "Failed to initialize monitoring server");
+                    None
                 }
             };
 
-            let fallback_coordinator_clone = fallback_coordinator.clone();
-            task_manager.spawn(async move {
-                // we just spawned a new task that's relevant to fallback coordination
-                // so register it with the fallback coordinator
-                let fallback_handler = fallback_coordinator_clone.register();
+            if let Some(monitoring_server) = monitoring_server {
+                // Create shutdown signal using cancellation token
+                let cancellation_token_clone = self.cancellation_token.clone();
+                let fallback_coordinator_token = fallback_coordinator.token();
+                let shutdown_signal = async move {
+                    tokio::select! {
+                        _ = cancellation_token_clone.cancelled() => {
+                            info!("Monitoring server: received shutdown signal.");
+                        }
+                        _ = fallback_coordinator_token.cancelled() => {
+                            info!("Monitoring server: fallback triggered.");
+                        }
+                    }
+                };
 
-                if let Err(e) = monitoring_server.run(shutdown_signal).await {
-                    error!("Monitoring server error: {:?}", e);
-                }
+                let fallback_coordinator_clone = fallback_coordinator.clone();
+                task_manager.spawn(async move {
+                    // we just spawned a new task that's relevant to fallback coordination
+                    // so register it with the fallback coordinator
+                    let fallback_handler = fallback_coordinator_clone.register();
 
-                // signal fallback coordinator that this task has completed its cleanup
-                fallback_handler.done();
-                info!("Monitoring server task exited and signaled fallback coordinator");
-            });
+                    if let Err(e) = monitoring_server.run(shutdown_signal).await {
+                        error!("Monitoring server error: {:?}", e);
+                    }
+
+                    // signal fallback coordinator that this task has completed its cleanup
+                    fallback_handler.done();
+                    info!("Monitoring server task exited and signaled fallback coordinator");
+                });
+            }
         }
 
-        let channel_manager_clone = channel_manager.clone();
+        let initial_channel_manager = channel_manager.clone();
         let mut bitcoin_core_sv2_join_handle: Option<JoinHandle<()>> = None;
+        let mut bitcoin_core_sv2_cancellation_token: Option<CancellationToken> = None;
 
         match self.config.template_provider_type().clone() {
             TemplateProviderType::Sv2Tp {
                 address,
                 public_key,
             } => {
-                let template_receiver = Sv2Tp::new(
+                let template_receiver = match Sv2Tp::new(
                     address.clone(),
                     public_key,
                     channel_manager_to_tp_receiver,
                     tp_to_channel_manager_sender,
                     self.cancellation_token.clone(),
-                    fallback_coordinator.clone(),
                     task_manager.clone(),
                 )
                 .await
-                .unwrap();
+                {
+                    Ok(template_receiver) => template_receiver,
+                    Err(e) => {
+                        error!(error = ?e, "Failed to initialize SV2 template receiver");
+                        self.cancellation_token.cancel();
+                        self.shutdown_notify.notify_waiters();
+                        self.is_alive.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                };
 
                 let cancellation_token_tp = self.cancellation_token.clone();
                 let status_sender_cl = status_sender.clone();
@@ -209,12 +238,20 @@ impl JobDeclaratorClient {
                 fee_threshold,
                 min_interval,
             } => {
-                let unix_socket_path = stratum_apps::tp_type::resolve_ipc_socket_path(
+                let unix_socket_path = match stratum_apps::tp_type::resolve_ipc_socket_path(
                     &network, data_dir,
-                )
-                .expect(
-                    "Could not determine Bitcoin data directory. Please set data_dir in config.",
-                );
+                ) {
+                    Some(unix_socket_path) => unix_socket_path,
+                    None => {
+                        error!(
+                            "Could not determine Bitcoin data directory. Please set data_dir in config."
+                        );
+                        self.cancellation_token.cancel();
+                        self.shutdown_notify.notify_waiters();
+                        self.is_alive.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                };
 
                 info!(
                     "Using Bitcoin Core IPC socket at: {}",
@@ -225,15 +262,17 @@ impl JobDeclaratorClient {
                 let incoming_tdp_receiver = channel_manager_to_tp_receiver.clone();
                 let outgoing_tdp_sender = tp_to_channel_manager_sender.clone();
 
+                let bitcoin_core_cancellation_token = CancellationToken::new();
                 let bitcoin_core_config = BitcoinCoreSv2TDPConfig {
                     unix_socket_path,
                     fee_threshold,
                     min_interval,
                     incoming_tdp_receiver,
                     outgoing_tdp_sender,
-                    cancellation_token: CancellationToken::new(),
+                    cancellation_token: bitcoin_core_cancellation_token.clone(),
                 };
 
+                bitcoin_core_sv2_cancellation_token = Some(bitcoin_core_cancellation_token);
                 bitcoin_core_sv2_join_handle = Some(
                     connect_to_bitcoin_core(
                         bitcoin_core_config,
@@ -323,10 +362,10 @@ impl JobDeclaratorClient {
                         )
                         .await;
 
-                    channel_manager_clone
+                    initial_channel_manager
                         .upstream_state
                         .set(UpstreamState::NoChannel);
-                    _ = channel_manager_clone.allocate_tokens(2).await;
+                    _ = initial_channel_manager.allocate_tokens(2).await;
                 }
                 Err(e) => {
                     tracing::error!("Failed to initialize upstream: {:?}", e);
@@ -335,22 +374,35 @@ impl JobDeclaratorClient {
             };
         }
 
-        _ = channel_manager_clone
-            .clone()
-            .start_downstream_server(
-                *self.config.authority_public_key(),
-                *self.config.authority_secret_key(),
-                self.config.cert_validity_sec(),
-                *self.config.listening_address(),
-                task_manager.clone(),
-                self.cancellation_token.clone(),
-                fallback_coordinator.clone(),
-                status_sender.clone(),
-                downstream_to_channel_manager_sender.clone(),
-                self.config.supported_extensions().to_vec(),
-                self.config.required_extensions().to_vec(),
-            )
-            .await;
+        task_manager.spawn({
+            let channel_manager = channel_manager.clone();
+            let config = self.config.clone();
+            let cancellation_token = self.cancellation_token.clone();
+            let fallback_coordinator = fallback_coordinator.clone();
+            let status_sender = status_sender.clone();
+            let task_manager = task_manager.clone();
+            async move {
+                if let Err(e) = channel_manager
+                    .start_downstream_server(
+                        *config.authority_public_key(),
+                        *config.authority_secret_key(),
+                        config.cert_validity_sec(),
+                        *config.listening_address(),
+                        task_manager,
+                        cancellation_token.clone(),
+                        fallback_coordinator,
+                        status_sender,
+                        downstream_to_channel_manager_sender,
+                        config.supported_extensions().to_vec(),
+                        config.required_extensions().to_vec(),
+                    )
+                    .await
+                {
+                    tracing::error!(?e, "Downstream server task exited with error");
+                    cancellation_token.cancel();
+                }
+            }
+        });
 
         info!("Spawning status listener task...");
 
@@ -416,7 +468,7 @@ impl JobDeclaratorClient {
                                     unbounded();
 
                                 // Create a fresh channel_manager with new channels
-                                channel_manager = ChannelManager::new(
+                                channel_manager = match ChannelManager::new(
                                     self.config.clone(),
                                     channel_manager_to_upstream_sender_new.clone(),
                                     upstream_to_channel_manager_receiver_new.clone(),
@@ -430,7 +482,14 @@ impl JobDeclaratorClient {
                                     self.config.required_extensions().to_vec(),
                                 )
                                 .await
-                                .unwrap();
+                                {
+                                    Ok(channel_manager) => channel_manager,
+                                    Err(e) => {
+                                        error!(error = ?e, "Failed to initialize channel manager during fallback");
+                                        self.cancellation_token.cancel();
+                                        break;
+                                    }
+                                };
 
                                 channel_manager
                                     .clone()
@@ -480,13 +539,13 @@ impl JobDeclaratorClient {
                                             )
                                             .await;
 
-                                        channel_manager_clone.upstream_state.set(UpstreamState::NoChannel);
+                                        channel_manager.upstream_state.set(UpstreamState::NoChannel);
 
-                                        _ = channel_manager_clone.allocate_tokens(2).await;
+                                        _ = channel_manager.allocate_tokens(2).await;
                                     }
                                     Err(e) => {
                                         tracing::error!("Failed to initialize upstream: {:?}", e);
-                                        channel_manager_clone.upstream_state.set(UpstreamState::SoloMining);
+                                        channel_manager.upstream_state.set(UpstreamState::SoloMining);
                                         set_jd_mode(jd_mode::JdMode::SoloMining);
                                         info!("Fallback to solo mining mode");
                                     }
@@ -500,64 +559,89 @@ impl JobDeclaratorClient {
                                         monitoring_addr
                                     );
 
-                                    let monitoring_server = stratum_apps::monitoring::MonitoringServer::new(
+                                    let monitoring_server = match stratum_apps::monitoring::MonitoringServer::new(
                                         monitoring_addr,
-                                        Some(Arc::new(channel_manager_clone.clone())),
-                                        Some(Arc::new(channel_manager_clone.clone())),
+                                        Some(Arc::new(channel_manager.clone())),
+                                        Some(Arc::new(channel_manager.clone())),
                                         std::time::Duration::from_secs(self.config.monitoring_cache_refresh_secs().unwrap_or(15)),
-                                    )
-                                    .expect("Failed to initialize monitoring server");
-
-                                    let cancellation_token_clone = self.cancellation_token.clone();
-                                    let fallback_coordinator_token = fallback_coordinator.token();
-                                    let shutdown_signal = async move {
-                                        tokio::select! {
-                                            _ = cancellation_token_clone.cancelled() => {
-                                                info!("Monitoring server: received shutdown signal.");
-                                            }
-                                            _ = fallback_coordinator_token.cancelled() => {
-                                                info!("Monitoring server: fallback triggered.");
-                                            }
+                                    ) {
+                                        Ok(monitoring_server) => Some(monitoring_server),
+                                        Err(e) => {
+                                            error!(error = ?e, "Failed to initialize monitoring server");
+                                            None
                                         }
                                     };
 
-                                    let fallback_coordinator_clone = fallback_coordinator.clone();
-                                    task_manager.spawn(async move {
-                                        // we just spawned a new task that's relevant to fallback coordination
-                                        // so register it with the fallback coordinator
-                                        let fallback_handler = fallback_coordinator_clone.register();
+                                    if let Some(monitoring_server) = monitoring_server {
+                                        let cancellation_token_clone = self.cancellation_token.clone();
+                                        let fallback_coordinator_token = fallback_coordinator.token();
+                                        let shutdown_signal = async move {
+                                            tokio::select! {
+                                                _ = cancellation_token_clone.cancelled() => {
+                                                    info!("Monitoring server: received shutdown signal.");
+                                                }
+                                                _ = fallback_coordinator_token.cancelled() => {
+                                                    info!("Monitoring server: fallback triggered.");
+                                                }
+                                            }
+                                        };
 
-                                        if let Err(e) = monitoring_server.run(shutdown_signal).await {
-                                            error!("Monitoring server error: {:?}", e);
-                                        }
+                                        let fallback_coordinator_clone = fallback_coordinator.clone();
+                                        task_manager.spawn(async move {
+                                            // we just spawned a new task that's relevant to fallback coordination
+                                            // so register it with the fallback coordinator
+                                            let fallback_handler = fallback_coordinator_clone.register();
 
-                                        // signal that this task has completed its cleanup
-                                        // (no-op during normal shutdown, only matters during fallback)
-                                        fallback_handler.done();
-                                        info!("Monitoring server task exited and signaled fallback coordinator");
-                                    });
+                                            if let Err(e) = monitoring_server.run(shutdown_signal).await {
+                                                error!("Monitoring server error: {:?}", e);
+                                            }
+
+                                            // signal that this task has completed its cleanup
+                                            // (no-op during normal shutdown, only matters during fallback)
+                                            fallback_handler.done();
+                                            info!("Monitoring server task exited and signaled fallback coordinator");
+                                        });
+                                    }
                                 }
 
-                                _ = channel_manager_clone.clone()
-                                    .start_downstream_server(
-                                        *self.config.authority_public_key(),
-                                        *self.config.authority_secret_key(),
-                                        self.config.cert_validity_sec(),
-                                        *self.config.listening_address(),
-                                        task_manager.clone(),
-                                        self.cancellation_token.clone(),
-                                        fallback_coordinator.clone(),
-                                        status_sender.clone(),
-                                        downstream_to_channel_manager_sender_new.clone(),
-                                        self.config.supported_extensions().to_vec(),
-                                        self.config.required_extensions().to_vec(),
-                                    )
-                                    .await;
+                                task_manager.spawn({
+                                    let channel_manager = channel_manager.clone();
+                                    let config = self.config.clone();
+                                    let cancellation_token = self.cancellation_token.clone();
+                                    let fallback_coordinator = fallback_coordinator.clone();
+                                    let status_sender = status_sender.clone();
+                                    let task_manager = task_manager.clone();
+                                    async move {
+                                        if let Err(e) = channel_manager
+                                            .start_downstream_server(
+                                                *config.authority_public_key(),
+                                                *config.authority_secret_key(),
+                                                config.cert_validity_sec(),
+                                                *config.listening_address(),
+                                                task_manager,
+                                                cancellation_token.clone(),
+                                                fallback_coordinator,
+                                                status_sender,
+                                                downstream_to_channel_manager_sender_new,
+                                                config.supported_extensions().to_vec(),
+                                                config.required_extensions().to_vec(),
+                                            )
+                                            .await
+                                        {
+                                            tracing::error!(?e, "Downstream server task exited with error");
+                                            cancellation_token.cancel();
+                                        }
+                                    }
+                                });
                                 }
                         }
                     }
                 }
             }
+        }
+
+        if let Some(bitcoin_core_sv2_cancellation_token) = bitcoin_core_sv2_cancellation_token {
+            bitcoin_core_sv2_cancellation_token.cancel();
         }
 
         if let Some(bitcoin_core_sv2_join_handle) = bitcoin_core_sv2_join_handle {
