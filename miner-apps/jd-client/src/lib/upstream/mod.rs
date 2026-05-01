@@ -16,7 +16,7 @@ use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
     custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
-    network_helpers::{connect_with_noise, resolve_host},
+    network_helpers::{connect_with_noise, resolve_host, TCP_CONNECT_TIMEOUT},
     stratum_core::{
         binary_sv2::Seq064K, extensions_sv2::RequestExtensions, framing_sv2,
         handlers_sv2::HandleCommonMessagesFromServerAsync, parsers_sv2::AnyMessage,
@@ -96,13 +96,10 @@ impl Upstream {
                 JDCError::fallback(JDCErrorKind::NetworkHelpersError(e.into()))
             })?;
 
-        let stream = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            TcpStream::connect(addr),
-        )
-        .await
-        .map_err(JDCError::fallback)?
-        .map_err(JDCError::fallback)?;
+        let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(JDCError::fallback)?
+            .map_err(JDCError::fallback)?;
         info!("Connected to upstream at {}", addr);
         debug!("Begin with noise setup in upstream connection");
 
