@@ -1,6 +1,6 @@
 use stratum_apps::{
     stratum_core::{
-        binary_sv2::{self, Sv2DataType, B016M},
+        binary_sv2::{Seq064K, Sv2DataType, B016M},
         bitcoin::{
             self, absolute::LockTime, transaction::Version, OutPoint, ScriptBuf, Sequence,
             Transaction, TxIn, TxOut, Witness,
@@ -299,7 +299,7 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
 
         let response = ProvideMissingTransactionsSuccess {
             request_id: msg.request_id,
-            transaction_list: binary_sv2::Seq064K::new(missing_txns).map_err(JDCError::shutdown)?,
+            transaction_list: Seq064K::new(missing_txns).map_err(JDCError::shutdown)?,
         };
         let message = JobDeclaration::ProvideMissingTransactionsSuccess(response);
 
