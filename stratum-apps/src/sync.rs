@@ -125,7 +125,10 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
 
     /// Get an owned clone of a value.
     ///
-    /// Prefer [`Self::with`] when only part of a large value is needed.
+    /// This releases the map entry guard immediately, so the entry may be removed
+    /// or replaced while the caller is still using the clone. Use this only when
+    /// stale clones are acceptable. Prefer [`Self::with`] or [`Self::with_mut`]
+    /// when later work depends on the entry still being present.
     pub fn get_cloned(&self, key: &K) -> Option<V>
     where
         V: Clone,

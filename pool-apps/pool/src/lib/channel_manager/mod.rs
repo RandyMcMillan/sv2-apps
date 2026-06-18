@@ -706,9 +706,15 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Runs `f` for a downstream that must still be connected.
+    /// Runs `f` while holding the downstream map entry guard.
     ///
-    /// Returns `DownstreamNotFound` if the downstream disappeared before the lookup completed.
+    /// Use this when mutations must only happen if the downstream is still
+    /// registered in the ChannelManager. Keep `f` short: do not perform blocking
+    /// work, send/forward messages, or re-enter `self.downstreams` inside it.
+    ///
+    /// Returns the closure result if the downstream is registered. Returns
+    /// `DownstreamNotFound` with a disconnect action if the downstream is no
+    /// longer registered.
     #[allow(clippy::result_large_err)]
     fn with_live_downstream<R, F>(
         &self,

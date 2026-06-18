@@ -10,7 +10,6 @@ use stratum_apps::monitoring::client::{
 use crate::{channel_manager::ChannelManager, downstream::Downstream};
 
 /// Helper to convert a Downstream to Sv2ClientInfo.
-/// Returns None if the lock cannot be acquired (graceful degradation for monitoring).
 fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
     let mut extended_channels = Vec::new();
     let mut standard_channels = Vec::new();
