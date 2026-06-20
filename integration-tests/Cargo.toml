@@ -70,3 +70,5 @@ harness = false
 [[bench]]
 name = "mining_device_scaling_bench"
 harness = false
+
+[workspace]
